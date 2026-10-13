@@ -4,10 +4,12 @@ import ReactMarkdown from "react-markdown";
 import rehypeHighlight from "rehype-highlight";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
-import type { ComponentPropsWithoutRef } from "react";
+import { useId, type ComponentPropsWithoutRef } from "react";
+import type { Element as HastElement, Root as HastRoot, RootContent as HastContent } from "hast";
 import type { Root, RootContent } from "mdast";
 import { isPathWithLineReference, isRepositoryFileHref } from "@/lib/diff-file-links";
 import { useSessionFileLinks } from "@/lib/session-file-links";
+import { getSafeExternalUrl } from "@/lib/urls";
 
 // Strict sanitization schema to prevent XSS
 // Based on GitHub's sanitization but even more restrictive
@@ -89,6 +91,12 @@ interface SafeMarkdownProps {
    * agent-authored text opts in; other markdown (e.g. pull request bodies) keeps plain links.
    */
   linkRepositoryFiles?: boolean;
+  /**
+   * Untrusted repository markdown, such as a changes preview. Https links open in a new
+   * tab, in-document anchors stay inside this document, and every other URL is inert so
+   * it cannot navigate the session or load a repository asset. Images are placeholders.
+   */
+  untrustedDocument?: boolean;
 }
 
 function MarkdownLink({ href, children, ...props }: ComponentPropsWithoutRef<"a">) {
@@ -140,22 +148,117 @@ function RepositoryFileMarkdownLink({ href, children, ...props }: ComponentProps
   );
 }
 
+const HEADING_TAGS = new Set(["h1", "h2", "h3", "h4", "h5", "h6"]);
+
+function hastText(node: HastRoot | HastContent): string {
+  if (node.type === "text") return node.value;
+  if ("children" in node) return node.children.map(hastText).join("");
+  return "";
+}
+
+function rehypeScopedHeadingIds(scope: string) {
+  return () => (tree: HastRoot) => {
+    const counts = new Map<string, number>();
+    const visit = (node: HastRoot | HastElement) => {
+      for (const child of node.children) {
+        if (child.type !== "element") continue;
+        if (HEADING_TAGS.has(child.tagName)) {
+          const base = slugifyHeading(hastText(child));
+          const seen = counts.get(base) ?? 0;
+          counts.set(base, seen + 1);
+          child.properties.id = `${scope}-${seen === 0 ? base : `${base}-${seen}`}`;
+        } else {
+          visit(child);
+        }
+      }
+    };
+    visit(tree);
+  };
+}
+
+function slugifyHeading(text: string): string {
+  const slug = text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, "")
+    .trim()
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
+  return slug || "section";
+}
+
+function scopedFragment(href: string, scope: string): string | null {
+  if (!href.startsWith("#") || href.length < 2) return null;
+  let fragment = href.slice(1);
+  try {
+    fragment = decodeURIComponent(fragment);
+  } catch {
+    return null;
+  }
+  fragment = fragment.toLowerCase();
+  if (!/^[\p{L}\p{N}_-]+$/u.test(fragment)) return null;
+  return `${scope}-${fragment}`;
+}
+
+function httpsDocumentHref(href: string | undefined): string | null {
+  const safe = getSafeExternalUrl(href);
+  if (!safe) return null;
+  return new URL(safe).protocol === "https:" ? safe : null;
+}
+
 export function SafeMarkdown({
   content,
   className = "",
   baseUrl,
   imageMode = DEFAULT_IMAGE_MODE,
   linkRepositoryFiles = false,
+  untrustedDocument = false,
 }: SafeMarkdownProps) {
+  const anchorScope = useId().replace(/[^A-Za-z0-9_-]/g, "");
+  const resolvedImageMode = untrustedDocument ? "placeholder" : imageMode;
+
   return (
     <div
       className={`prose prose-sm dark:prose-invert min-w-0 max-w-none break-words [overflow-wrap:anywhere] ${className}`}
     >
       <ReactMarkdown
         remarkPlugins={linkRepositoryFiles ? [remarkGfm, preserveFileLineReferences] : [remarkGfm]}
-        rehypePlugins={[rehypeHighlight, [rehypeSanitize, sanitizeSchema]]}
+        rehypePlugins={
+          untrustedDocument
+            ? [
+                rehypeHighlight,
+                [rehypeSanitize, sanitizeSchema],
+                rehypeScopedHeadingIds(anchorScope),
+              ]
+            : [rehypeHighlight, [rehypeSanitize, sanitizeSchema]]
+        }
         components={{
           a: ({ href, children, ...props }: ComponentPropsWithoutRef<"a">) => {
+            if (untrustedDocument) {
+              const external = httpsDocumentHref(href);
+              if (external) {
+                return (
+                  <MarkdownLink href={external} {...props}>
+                    {children}
+                  </MarkdownLink>
+                );
+              }
+              const fragment = href ? scopedFragment(href, anchorScope) : null;
+              if (fragment) {
+                return (
+                  <a href={`#${fragment}`} className="text-accent hover:underline">
+                    {children}
+                  </a>
+                );
+              }
+              return (
+                <span
+                  className="text-muted-foreground"
+                  title={href ? `Not opened from preview: ${href}` : undefined}
+                >
+                  {children}
+                </span>
+              );
+            }
             const resolvedHref = resolveMarkdownUrl(href, baseUrl);
             if (!resolvedHref) return <span>{children}</span>;
             if (linkRepositoryFiles && isRepositoryFileHref(href)) {
@@ -176,7 +279,7 @@ export function SafeMarkdown({
               typeof src === "string" ? src : undefined,
               baseUrl
             );
-            if (imageMode !== "placeholder") return null;
+            if (resolvedImageMode !== "placeholder") return null;
             return <span>{resolvedSrc ? `${alt?.trim() || "Image"}: ${resolvedSrc}` : alt}</span>;
           },
           // Code blocks with styling
